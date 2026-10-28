@@ -1,0 +1,66 @@
+name: Gate Probe Publisher
+on:
+  workflow_run:
+    workflows: [Gate Probe PR]
+    types: [in_progress, completed]
+permissions:
+  contents: read
+concurrency:
+  group: gate-probe-status-${{ github.event.workflow_run.id }}
+  cancel-in-progress: false
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+      checks: write
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const {owner, repo} = context.repo;
+            const eventRun = context.payload.workflow_run;
+            const {data: run} = await github.rest.actions.getWorkflowRun({owner, repo, run_id: eventRun.id});
+            if (run.event !== 'pull_request' || run.path !== '.github/workflows/probe-pr.yml') return;
+            const prefix = `neutral-gate-probe:${run.id}:`;
+            const external = prefix + run.run_attempt;
+            const all = await github.paginate(github.rest.checks.listForRef, {owner, repo, ref: run.head_sha, check_name: 'PR Gate', filter: 'all', per_page: 100});
+            const owned = all.filter(c => c.name === 'PR Gate' && c.app?.slug === 'github-actions' && c.external_id?.startsWith(prefix));
+            if (run.status !== 'completed' && owned.length === 0) return;
+            let verdict = 'pending';
+            if (run.status === 'completed' && run.conclusion !== 'success') verdict = 'failure';
+            else if (run.status === 'completed' && run.run_attempt > 1) verdict = 'success';
+            const visible = await github.paginate(github.rest.checks.listForRef, {owner, repo, ref: run.head_sha, check_name: 'PR Gate', filter: 'latest', per_page: 100});
+            const visibleIds = new Set(visible.map(c => c.id));
+            const existing = owned.filter(c => c.external_id === external && visibleIds.has(c.id)).sort((a,b) => b.id-a.id)[0];
+            const payload = {
+              name: 'PR Gate', external_id: external,
+              status: verdict === 'pending' ? 'in_progress' : 'completed',
+              details_url: run.html_url,
+              output: {title: `PROBE attempt ${run.run_attempt}: ${verdict}`, summary: 'Sandbox probe only. New pending/failure must block; only completed success may allow merging.'}
+            };
+            if (verdict !== 'pending') payload.conclusion = verdict;
+            let currentId;
+            if (existing) {
+              currentId = existing.id;
+              await github.rest.checks.update({owner, repo, check_run_id: currentId, ...payload});
+            } else {
+              const {data: created} = await github.rest.checks.create({owner, repo, head_sha: run.head_sha, ...payload});
+              currentId = created.id;
+            }
+            // Deliberately reproduce the reviewed behavior, including neutral retirement.
+            for (const old of owned) {
+              const attempt = Number(old.external_id.slice(prefix.length));
+              if (old.status === 'in_progress' && old.id !== currentId && Number.isInteger(attempt) && attempt <= run.run_attempt) {
+                await github.rest.checks.update({owner, repo, check_run_id: old.id, status: 'completed', conclusion: 'neutral'});
+              }
+            }
+            for (const filter of ['all', 'latest']) {
+              const checks = await github.paginate(github.rest.checks.listForRef, {owner, repo, ref: run.head_sha, check_name: 'PR Gate', filter, per_page: 100});
+              const snapshot = checks.map(c => ({id:c.id, suite:c.check_suite?.id, status:c.status, conclusion:c.conclusion, external_id:c.external_id, completed_at:c.completed_at}));
+              core.info(JSON.stringify({run:run.id, attempt:run.run_attempt, verdict, filter, checks:snapshot}));
+              core.summary.addHeading(`Attempt ${run.run_attempt}: ${verdict}; filter=${filter}`).addCodeBlock(JSON.stringify(snapshot,null,2),'json');
+            }
+            await core.summary.write();

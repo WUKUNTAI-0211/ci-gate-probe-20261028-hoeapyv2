@@ -1,0 +1,24 @@
+name: Gate Probe PR
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+permissions:
+  contents: read
+concurrency:
+  group: gate-probe-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+jobs:
+  execute:
+    name: Probe execution
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - name: First run passes; second run fails; later runs pass
+        env:
+          ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          if [ "$ATTEMPT" -eq 1 ]; then exit 0; fi
+          echo 'Observation window: the new PR Gate must block merging now.'
+          sleep 180
+          if [ "$ATTEMPT" -eq 2 ]; then exit 1; fi
